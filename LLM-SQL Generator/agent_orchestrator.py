@@ -22,6 +22,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import re
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -71,13 +73,87 @@ class Bitnet1BitRouter(IntentRouter):
     """Production implementation: shells out to a local bitnet.cpp inference
     binary running a ternary-weight (1.58-bit) classifier fine-tuned to emit
     exactly 'SQL_INTENT' or 'OUT_OF_SCOPE'. See RUN.md for how to obtain and
-    build the model/binary. Kept fully local — no network call."""
+    build the model/binary. Kept fully local — no network call.
 
-    def __init__(self, binary_path: str, model_path: str):
+    The router is the gatekeeper: it decides whether the user query proceeds
+    to the SQL generation LLM or is refused.
+
+    macOS/Apple Silicon notes:
+    - If the binary is an x86_64 build (recommended until upstream arm64
+      issues #600/#618 are fixed), it is launched via `/usr/bin/arch -x86_64`
+      so it runs under Rosetta 2.
+    - `--single-turn` is passed so llama-cli exits after answering instead of
+      dropping into interactive chat mode.
+    - The response is parsed after the 'BITNETAssistant:' marker, because the
+      CLI echoes the prompt (which itself contains both label strings).
+    - When the model output is unparseable (known upstream bugs produce
+      garbage tokens on ARM/x86-Rosetta), the router probes once with a
+      known in-scope canary phrase; if that is also unparseable, it
+      transparently falls back to KeywordFallbackRouter so the pipeline
+      stays usable instead of refusing everything.
+    """
+
+    # A query that any working classifier must label SQL_INTENT.
+    _CANARY = "List all accounts"
+
+    def __init__(self, binary_path: str, model_path: str,
+                 fallback: Optional[IntentRouter] = None):
         self.binary_path = binary_path
         self.model_path = model_path
+        self._fallback = fallback
+        # None = not yet probed; restored from the probe cache when the same
+        # binary+model combo was already found broken in a previous run.
+        self._model_broken: Optional[bool] = (
+            True if self._read_broken_marker() else None
+        )
+        if self._model_broken:
+            print(
+                "[Bitnet1BitRouter] cached probe: model unparseable on this "
+                "hardware — using keyword fallback "
+                f"(delete {self._broken_marker_path()} to re-probe)",
+                file=sys.stderr,
+            )
+        # Detect binary architecture once; x86_64 binaries on arm64 hosts
+        # must run through Rosetta 2.
+        try:
+            info = subprocess.run(
+                ["file", "-b", binary_path], capture_output=True, text=True, timeout=5
+            ).stdout
+            self._needs_rosetta = "x86_64" in info
+        except Exception:
+            self._needs_rosetta = False
 
-    def classify(self, user_query: str) -> str:
+    # -- probe-result cache --------------------------------------------------
+
+    def _broken_marker_path(self) -> str:
+        return self.model_path + ".router-probe"
+
+    def _read_broken_marker(self) -> bool:
+        """True when a previous probe already found this exact binary (path +
+        mtime) broken, so we can skip the slow re-run of the broken model."""
+        try:
+            with open(self._broken_marker_path()) as f:
+                recorded = f.read().strip()
+            current = f"{self.binary_path}:{os.path.getmtime(self.binary_path)}"
+            return recorded == current
+        except OSError:
+            return False
+
+    def _write_broken_marker(self) -> None:
+        """Cache the probe result next to the model file. A rebuilt binary has
+        a different mtime, so the next run re-probes automatically."""
+        try:
+            current = f"{self.binary_path}:{os.path.getmtime(self.binary_path)}"
+            with open(self._broken_marker_path(), "w") as f:
+                f.write(current)
+        except OSError:
+            pass  # cache is best-effort
+
+    # -- internal helpers ---------------------------------------------------
+
+    def _run_model(self, user_query: str) -> Optional[str]:
+        """Run the 1-bit model once. Returns 'SQL_INTENT', 'OUT_OF_SCOPE',
+        or None when the output could not be parsed (garbage/timeout)."""
         prompt = (
             "Classify the following user request for a brokerage data system. "
             "Respond with exactly one token: SQL_INTENT if it asks to retrieve "
@@ -86,12 +162,168 @@ class Bitnet1BitRouter(IntentRouter):
             "OUT_OF_SCOPE otherwise (including any request to modify data).\n\n"
             f"Request: {user_query}\nAnswer:"
         )
-        result = subprocess.run(
-            [self.binary_path, "-m", self.model_path, "-p", prompt, "-n", "4"],
-            capture_output=True, text=True, timeout=10,
-        )
-        out = result.stdout.strip().upper()
-        return "SQL_INTENT" if "SQL_INTENT" in out else "OUT_OF_SCOPE"
+        cmd = [
+            self.binary_path,
+            "-m", self.model_path,
+            "-p", prompt,
+            "-n", "8",        # one label token is enough, small headroom
+            "-st",            # single turn: exit after the answer
+            "-t", "8",        # threads
+            "--temp", "0",    # deterministic classification
+        ]
+        if self._needs_rosetta:
+            cmd = ["/usr/bin/arch", "-x86_64", *cmd]
+
+        try:
+            # stdin=DEVNULL + start_new_session: detach from the controlling
+            # terminal so llama-cli's interactive banner never reaches the
+            # user's TTY and the process can never block waiting for input.
+            result = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=180,
+                stdin=subprocess.DEVNULL, start_new_session=True,
+            )
+        except subprocess.TimeoutExpired:
+            return None
+
+        out = result.stdout
+        marker = "BITNETAssistant:"
+        if marker in out:
+            # TTY-attached runs apply the chat template; the answer follows it.
+            response = out.split(marker, 1)[1]
+        elif "Answer:" in out:
+            # Detached (non-TTY) runs skip the template and echo the raw
+            # prompt — which itself contains BOTH label strings, so we must
+            # only inspect the generation that follows the final "Answer:".
+            response = out.rsplit("Answer:", 1)[1]
+        else:
+            return None
+        # Drop the stats footer and spinner artifacts (char + backspace pairs).
+        response = response.split("[ Prompt:", 1)[0]
+        response = re.sub(r".\x08", "", response).upper()
+        if "OUT_OF_SCOPE" in response:
+            return "OUT_OF_SCOPE"
+        if "SQL_INTENT" in response:
+            return "SQL_INTENT"
+        return None  # unparseable/garbage output
+
+    # -- public API ---------------------------------------------------------
+
+    def classify(self, user_query: str) -> str:
+        # Once we've determined the model is broken, skip it entirely.
+        if self._model_broken and self._fallback is not None:
+            return self._fallback.classify(user_query)
+
+        verdict = self._run_model(user_query)
+        if verdict is not None:
+            return verdict  # model answered with a real label — trust it
+
+        # Garbage output: probe with the canary once to distinguish
+        # "model is broken" from "this query confused the model".
+        if self._model_broken is None:
+            canary = self._run_model(self._CANARY)
+            self._model_broken = canary is None
+            if self._model_broken:
+                self._write_broken_marker()
+                print(
+                    "[Bitnet1BitRouter] model output unparseable "
+                    "(known upstream ARM/x86 bug) — falling back to "
+                    "KeywordFallbackRouter",
+                    file=sys.stderr,
+                )
+
+        if self._model_broken and self._fallback is not None:
+            return self._fallback.classify(user_query)
+        return "OUT_OF_SCOPE"  # model works but this query got garbage: refuse
+
+
+class OllamaBitnetRouter(IntentRouter):
+    """1-bit architecture intent router: the real BitNet b1.58 (1.58-bit,
+    ternary-weight) model served locally by Ollama — no network call, no API
+    key.
+
+    Why Ollama instead of bitnet.cpp: the official i2_s CPU kernels are
+    broken on Apple Silicon for this checkpoint (upstream issues #585/#600 —
+    wrong weight-group layout, plus a residual bug in activation handling),
+    so this router runs the SAME ternary-weight model from q8_0-storage GGUF
+    (larenspear/bitnet_b1_58-large-GGUF). Identical weights, standard
+    (correct) kernels.
+
+    It is a base (non-instruct) model, so classification is done as few-shot
+    completion. Three rotations of the example set are voted on (majority
+    wins) to reduce small-model noise; ties/unparseable votes fall back to
+    `fallback` when given, else refuse conservatively.
+    """
+
+    EXAMPLES = [
+        ("List all customers", "YES"),
+        ("Tell me a joke", "NO"),
+        ("How many orders were placed today?", "YES"),
+        ("What is the capital of France?", "NO"),
+        ("Which accounts hold Tesla shares?", "YES"),
+        ("Write a poem about the sea", "NO"),
+        ("Show total cash balance", "YES"),
+        ("Translate this text into French", "NO"),
+        ("What is 5 times 3?", "NO"),
+    ]
+
+    HEADER = (
+        "Task: decide whether a request asks to read brokerage data "
+        "(customers, accounts, orders, trades, positions, holdings, margin, "
+        "risk). Answer YES or NO.\n\n"
+    )
+
+    def __init__(self, model: str = "bitnet-b1.58-large",
+                 url: str = "http://localhost:11434",
+                 fallback: Optional[IntentRouter] = None,
+                 votes: int = 3):
+        self.model = model
+        self.url = url.rstrip("/")
+        self._fallback = fallback
+        self._votes = max(1, votes)
+
+    def _prompt(self, user_query: str, rotate: int) -> str:
+        n = len(self.EXAMPLES)
+        ex = self.EXAMPLES[rotate % n:] + self.EXAMPLES[:rotate % n]
+        shots = "".join(f"Request: {q}\nAnswer: {a}\n\n" for q, a in ex)
+        return f"{self.HEADER}{shots}Request: {user_query}\nAnswer:"
+
+    def _vote(self, user_query: str, rotate: int) -> Optional[str]:
+        import requests
+        try:
+            resp = requests.post(
+                f"{self.url}/api/generate",
+                json={
+                    "model": self.model,
+                    "prompt": self._prompt(user_query, rotate),
+                    "stream": False,
+                    "options": {"temperature": 0, "num_predict": 4, "stop": ["\n"]},
+                },
+                timeout=120,
+            )
+            resp.raise_for_status()
+        except Exception:
+            return None
+        text = resp.json().get("response", "").strip().upper()
+        words = text.split()
+        first = words[0] if words else ""
+        if first.startswith("YES"):
+            return "SQL_INTENT"
+        if first.startswith("NO"):
+            return "OUT_OF_SCOPE"
+        return None
+
+    def classify(self, user_query: str) -> str:
+        votes = [self._vote(user_query, 2 * i) for i in range(self._votes)]
+        valid = [v for v in votes if v is not None]
+        if valid:
+            yes = valid.count("SQL_INTENT")
+            no = valid.count("OUT_OF_SCOPE")
+            if yes != no:
+                return "SQL_INTENT" if yes > no else "OUT_OF_SCOPE"
+        # tie or all unparseable → fallback / conservative refusal
+        if self._fallback is not None:
+            return self._fallback.classify(user_query)
+        return "OUT_OF_SCOPE"
 
 
 # ---------------------------------------------------------------------------
@@ -396,16 +628,38 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--dsn", required=True)
     parser.add_argument("--graph-path", default="schema_graph.gpickle")
+    parser.add_argument("--router", choices=["auto", "bitnet-cpp", "ollama-bitnet", "keyword"],
+                        default="auto",
+                        help="Intent router: bitnet-cpp = native i2_s binary; "
+                             "ollama-bitnet = BitNet b1.58 (1.58-bit) via local Ollama; "
+                             "keyword = heuristic fallback. auto = bitnet-cpp when "
+                             "--bitnet-binary/--bitnet-model are given, else keyword.")
     parser.add_argument("--bitnet-binary", default=None)
     parser.add_argument("--bitnet-model", default=None)
+    parser.add_argument("--ollama-url", default="http://localhost:11434")
+    parser.add_argument("--ollama-router-model", default="bitnet-b1.58-large")
     parser.add_argument("query", help="Natural language request")
     args = parser.parse_args()
 
     conn = psycopg2.connect(args.dsn)
 
     router: IntentRouter
-    if args.bitnet_binary and args.bitnet_model:
-        router = Bitnet1BitRouter(args.bitnet_binary, args.bitnet_model)
+    if args.router == "keyword":
+        router = KeywordFallbackRouter()
+    elif args.router == "ollama-bitnet":
+        router = OllamaBitnetRouter(
+            model=args.ollama_router_model, url=args.ollama_url,
+            fallback=KeywordFallbackRouter(),
+        )
+    elif args.router == "bitnet-cpp" or (
+        args.router == "auto" and args.bitnet_binary and args.bitnet_model
+    ):
+        if not (args.bitnet_binary and args.bitnet_model):
+            parser.error("--router bitnet-cpp requires --bitnet-binary and --bitnet-model")
+        router = Bitnet1BitRouter(
+            args.bitnet_binary, args.bitnet_model,
+            fallback=KeywordFallbackRouter(),
+        )
     else:
         router = KeywordFallbackRouter()
 
