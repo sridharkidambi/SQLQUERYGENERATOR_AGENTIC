@@ -1,0 +1,47 @@
+services:
+  postgres:
+    image: pgvector/pgvector:pg16   # postgres:16 with the pgvector extension pre-installed
+    container_name: brokerage_pg
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-brokerage_db}
+      POSTGRES_USER: ${POSTGRES_USER:-brokerage}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-brokerage_dev_pw}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      # docker-entrypoint-initdb.d scripts run once, in filename order, only
+      # on first container init (empty data volume). Re-running schema
+      # changes later goes through migrations, not this mount.
+      - ./init/00_extensions.sql:/docker-entrypoint-initdb.d/00_extensions.sql:ro
+      - ./schema.sql:/docker-entrypoint-initdb.d/01_schema.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-brokerage} -d ${POSTGRES_DB:-brokerage_db}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  app:
+    build: .
+    container_name: brokerage_agent
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PGDSN: postgresql://${POSTGRES_USER:-brokerage}:${POSTGRES_PASSWORD:-brokerage_dev_pw}@postgres:5432/${POSTGRES_DB:-brokerage_db}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+    volumes:
+      # Code mounted read-write so schema_graph.gpickle and eval_report.json
+      # land on the host, and so you can iterate without rebuilding the image.
+      - ./:/app
+    working_dir: /app
+    tty: true
+    stdin_open: true
+    # Idle by default; drive it with `docker compose exec app ...` or
+    # `docker compose run --rm app ...` per the commands in DOCKER.md.
+    command: ["sleep", "infinity"]
+
+volumes:
+  pgdata:
