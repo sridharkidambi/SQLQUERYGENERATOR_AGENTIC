@@ -132,22 +132,21 @@ class HybridRetriever:
     def _vector_search(self, user_query: str) -> list[dict]:
         emb = self._embed(user_query)
         with self.conn.cursor() as cur:
-            # Rank chunks by cosine distance, then keep the best chunk per table.
-            # (SELECT DISTINCT ... ORDER BY <distance> is invalid in Postgres —
-            # the ORDER BY expression must appear in the select list.)
+            # Rank ALL chunks by cosine distance, then take the top tables
+            # by their best-matching chunk. This avoids losing relevant
+            # tables whose best chunk happens to rank below the cutoff.
             cur.execute(
-                """SELECT table_name, metadata, chunk_text FROM (
-                       SELECT table_name, metadata, chunk_text, level,
-                              ROW_NUMBER() OVER (
-                                  PARTITION BY table_name
-                                  ORDER BY embedding <=> %s::vector
-                              ) AS rn
+                """SELECT table_name, metadata, chunk_text, dist
+                   FROM (
+                       SELECT table_name, metadata, chunk_text,
+                              embedding <=> %s::vector AS dist,
+                              MIN(embedding <=> %s::vector) OVER (PARTITION BY table_name) AS best_dist
                        FROM schema_embeddings
+                       WHERE level = 'table'
                    ) ranked
-                   WHERE rn = 1
-                   ORDER BY table_name
+                   ORDER BY best_dist
                    LIMIT %s;""",
-                (emb, self.top_k),
+                (emb, emb, self.top_k),
             )
             rows = cur.fetchall()
         return [{"table": r[0], "metadata": r[1], "chunk_text": r[2]} for r in rows]
@@ -240,23 +239,34 @@ user request. Rules, no exceptions:
 
 
 class SQLGenerationAgent:
-    def __init__(self, anthropic_client, model: str = "claude-sonnet-4-6"):
-        self.client = anthropic_client
+    """Generates SQL via a local Ollama model (no API key needed)."""
+
+    def __init__(self, ollama_url: str = "http://localhost:11434", model: str = "llama3.2:latest"):
+        self.url = ollama_url.rstrip("/")
         self.model = model
 
     def generate(self, user_query: str, context: SchemaContext, retry_feedback: Optional[str] = None) -> str:
+        import requests
+
         user_content = f"SCHEMA CONTEXT:\n{context.as_prompt_block()}\n\nREQUEST:\n{user_query}"
         if retry_feedback:
             user_content += f"\n\nThe previous attempt failed validation: {retry_feedback}\nGenerate a corrected statement."
 
-        resp = self.client.messages.create(
-            model=self.model,
-            max_tokens=1000,
-            system=SQL_SYSTEM_PROMPT,
-            messages=[{"role": "user", "content": user_content}],
+        resp = requests.post(
+            f"{self.url}/api/chat",
+            json={
+                "model": self.model,
+                "messages": [
+                    {"role": "system", "content": SQL_SYSTEM_PROMPT},
+                    {"role": "user", "content": user_content},
+                ],
+                "stream": False,
+                "options": {"temperature": 0.0, "num_predict": 500},
+            },
+            timeout=60,
         )
-        text_blocks = [b.text for b in resp.content if getattr(b, "type", None) == "text"]
-        return "\n".join(text_blocks).strip()
+        resp.raise_for_status()
+        return resp.json()["message"]["content"].strip()
 
 
 # ---------------------------------------------------------------------------
@@ -301,7 +311,14 @@ class ValidationAgent:
 
         known = self._known_identifiers()
         known_tables = set(known.keys())
-        used_tables = {t.name for t in parsed.find_all(exp.Table)}
+
+        # Exclude CTE aliases — they are defined in the query itself, not real tables.
+        cte_names = set()
+        for with_clause in parsed.find_all(exp.With):
+            for cte in with_clause.expressions:
+                cte_names.add(cte.alias)
+
+        used_tables = {t.name for t in parsed.find_all(exp.Table)} - cte_names
         unknown_tables = used_tables - known_tables
         if unknown_tables:
             return ValidationResult(ok=False, sql=sql, error=f"unknown table(s): {unknown_tables}")
@@ -395,9 +412,7 @@ def main() -> None:
     retriever = HybridRetriever(conn, graph_path=args.graph_path)
     validator = ValidationAgent(conn)
 
-    import anthropic
-    client = anthropic.Anthropic()
-    generator = SQLGenerationAgent(client)
+    generator = SQLGenerationAgent()
 
     orchestrator = Orchestrator(router, retriever, generator, validator)
     print(orchestrator.handle(args.query))

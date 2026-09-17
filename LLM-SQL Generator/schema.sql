@@ -499,6 +499,11 @@ CREATE TABLE risk_limits (
   UNIQUE (account_id, limit_type, effective_from)
 );
 COMMENT ON TABLE risk_limits IS 'Per-account (or platform-wide when account_id IS NULL) risk thresholds and their current utilization.';
+COMMENT ON COLUMN risk_limits.limit_type IS 'Category of risk limit: MARGIN_UTILIZATION, CONCENTRATION, LEVERAGE, NET_EXPOSURE, etc.';
+COMMENT ON COLUMN risk_limits.limit_value IS 'The configured maximum allowed value for this risk limit.';
+COMMENT ON COLUMN risk_limits.current_value IS 'The live, current measured value of this risk metric.';
+COMMENT ON COLUMN risk_limits.is_breached IS 'TRUE when current_value exceeds limit_value, meaning the risk limit is currently breached.';
+COMMENT ON COLUMN risk_limits.account_id IS 'The account this risk limit applies to; NULL means a platform-wide limit.';
 CREATE INDEX idx_risk_limits_breached ON risk_limits (is_breached) WHERE is_breached = TRUE;
 
 CREATE TABLE fee_schedules (
