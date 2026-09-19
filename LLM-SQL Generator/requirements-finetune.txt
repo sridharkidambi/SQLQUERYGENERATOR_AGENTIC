@@ -1,0 +1,14 @@
+# Optional deps for finetune_lora.py only. Kept out of requirements.txt so
+# the baseline pipeline (ingestion_pipeline.py, agent_orchestrator.py,
+# evaluate.py) stays installable on a machine with no GPU and no interest
+# in training a model.
+#
+#   pip install -r requirements-finetune.txt
+
+torch>=2.3
+transformers>=4.44
+peft>=0.12
+trl>=0.9
+accelerate>=0.33
+datasets>=2.20
+bitsandbytes>=0.43  # only needed for 4-/8-bit loading on CUDA; omit on CPU/MPS

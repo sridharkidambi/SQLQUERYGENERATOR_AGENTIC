@@ -567,6 +567,11 @@ class ValidationAgent:
                 cur.execute(f"EXPLAIN (FORMAT JSON) {sql}")
                 plan = cur.fetchone()[0]
         except Exception:
+            # A failed EXPLAIN leaves the session mid-transaction in
+            # postgres's "aborted" state; roll back so every later query on
+            # this same connection (e.g. the next validate() call) doesn't
+            # also raise InFailedSqlTransaction.
+            self.conn.rollback()
             return suggestions
 
         def walk(node):

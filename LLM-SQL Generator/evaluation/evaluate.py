@@ -31,7 +31,13 @@ environment isolates ragas in its own virtualenv, `run_ragas_retrieval()`
 below is provided as a drop-in alternative for step B's retrieval half —
 see the RAGAS section and EVALUATION.md for when to prefer it.
 
-Run: python evaluate.py --dsn postgresql://... --dataset eval_dataset.jsonl
+Run (from the project root or this directory — paths resolve either way):
+  python evaluate.py --dsn postgresql://...
+
+By default the DeepEval judge is a local Ollama model (--judge ollama,
+--judge-model llama3.2:latest), matching the rest of this project's
+no-API-key setup. Use --judge openai with OPENAI_API_KEY set for DeepEval's
+built-in default instead.
 """
 
 from __future__ import annotations
@@ -40,13 +46,22 @@ import argparse
 import json
 import sys
 from dataclasses import dataclass, asdict
+from pathlib import Path
 from typing import Optional
 
 import psycopg2
 
+# evaluate.py lives in evaluation/ but exercises the pipeline one level up —
+# put the project root on sys.path so the import works from any CWD, and
+# resolve default data paths relative to this script, not the CWD.
+EVAL_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = EVAL_DIR.parent
+sys.path.insert(0, str(PROJECT_ROOT))
+
 from agent_orchestrator import (
     KeywordFallbackRouter,
     Bitnet1BitRouter,
+    OllamaBitnetRouter,
     HybridRetriever,
     SQLGenerationAgent,
     ValidationAgent,
@@ -89,6 +104,7 @@ def load_dataset(path: str) -> list[EvalCase]:
 class CaseResult:
     id: str
     category: str
+    nl_query: str
     gold_scope: str
     predicted_scope: str
     intent_correct: bool
@@ -148,6 +164,7 @@ def run_deterministic(
     return CaseResult(
         id=case.id,
         category=case.category,
+        nl_query=case.nl_query,
         gold_scope=case.scope,
         predicted_scope=predicted_scope,
         intent_correct=intent_correct,
@@ -166,11 +183,59 @@ def run_deterministic(
 # B. DeepEval LLM-judged checks
 # ---------------------------------------------------------------------------
 
-def run_deepeval_metrics(results: list[CaseResult]) -> None:
+def build_ollama_judge(model: str, url: str):
+    """A DeepEval judge model backed by local Ollama — no API key, matching
+    the rest of this project. DeepEval's built-in default judge is OpenAI;
+    this wrapper satisfies DeepEvalBaseLLM (generate / a_generate /
+    get_model_name) against Ollama's /api/chat. When DeepEval asks for
+    structured output (a pydantic schema), we switch on Ollama's JSON mode
+    and append the schema to the prompt."""
+    from deepeval.models.base_model import DeepEvalBaseLLM
+
+    class OllamaJudge(DeepEvalBaseLLM):
+        def __init__(self, model_name: str, base_url: str):
+            self._model_name = model_name
+            self._base_url = base_url.rstrip("/")
+
+        def load_model(self):
+            return None  # Ollama serves the model; nothing to load client-side
+
+        def get_model_name(self) -> str:
+            return f"ollama/{self._model_name}"
+
+        def generate(self, prompt: str, schema=None, **kwargs) -> str:
+            import requests
+
+            payload: dict = {
+                "model": self._model_name,
+                "messages": [{"role": "user", "content": prompt}],
+                "stream": False,
+                "options": {"temperature": 0.0},
+            }
+            if schema is not None:
+                payload["format"] = "json"
+                payload["messages"][0]["content"] += (
+                    "\n\nRespond with ONLY one valid JSON object conforming to "
+                    "this JSON Schema (no prose, no markdown fences):\n"
+                    + json.dumps(schema.model_json_schema())
+                )
+            resp = requests.post(
+                f"{self._base_url}/api/chat", json=payload, timeout=300
+            )
+            resp.raise_for_status()
+            return resp.json()["message"]["content"].strip()
+
+        async def a_generate(self, prompt: str, schema=None, **kwargs) -> str:
+            return self.generate(prompt, schema, **kwargs)
+
+    return OllamaJudge(model, url)
+
+
+def run_deepeval_metrics(results: list[CaseResult], judge=None) -> None:
     """Mutates results in place, filling geval_correctness / contextual_*
-    for cases that reached SQL generation. Requires DEEPEVAL / underlying
-    judge-model API credentials (defaults to OpenAI unless configured
-    otherwise — see EVALUATION.md for pointing DeepEval at Claude)."""
+    for cases that reached SQL generation. Pass judge=build_ollama_judge(...)
+    to keep judging local; judge=None uses DeepEval's default (OpenAI,
+    needs OPENAI_API_KEY)."""
     from deepeval import evaluate as deepeval_evaluate
     from deepeval.metrics import GEval, ContextualPrecisionMetric, ContextualRecallMetric
     from deepeval.test_case import LLMTestCase, LLMTestCaseParams
@@ -193,9 +258,10 @@ def run_deepeval_metrics(results: list[CaseResult]) -> None:
             LLMTestCaseParams.EXPECTED_OUTPUT,
         ],
         threshold=0.6,
+        model=judge,
     )
-    contextual_precision = ContextualPrecisionMetric(threshold=0.6)
-    contextual_recall = ContextualRecallMetric(threshold=0.6)
+    contextual_precision = ContextualPrecisionMetric(threshold=0.6, model=judge)
+    contextual_recall = ContextualRecallMetric(threshold=0.6, model=judge)
 
     test_cases = []
     indexable = []
@@ -203,7 +269,7 @@ def run_deepeval_metrics(results: list[CaseResult]) -> None:
         if r.generated_sql is None or r.gold_sql is None:
             continue
         tc = LLMTestCase(
-            input=r.id,  # placeholder; replaced below with real nl_query at call site if needed
+            input=r.nl_query,
             actual_output=r.generated_sql,
             expected_output=r.gold_sql,
             retrieval_context=r.predicted_tables or ["<no tables retrieved>"],
@@ -320,10 +386,24 @@ def print_report(results: list[CaseResult], summary: dict) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--dsn", required=True)
-    parser.add_argument("--dataset", default="eval_dataset.jsonl")
-    parser.add_argument("--graph-path", default="schema_graph.gpickle")
+    parser.add_argument("--dataset", default=str(EVAL_DIR / "eval_dataset.jsonl"))
+    parser.add_argument("--graph-path", default=str(PROJECT_ROOT / "schema_graph.gpickle"))
+    parser.add_argument("--router", choices=["keyword", "ollama-bitnet", "bitnet-cpp"],
+                        default="keyword",
+                        help="Intent router under test. keyword = heuristic fallback "
+                             "(default, cheap/deterministic); ollama-bitnet = the 1-bit "
+                             "BitNet router via local Ollama; bitnet-cpp = native binary.")
     parser.add_argument("--bitnet-binary", default=None)
     parser.add_argument("--bitnet-model", default=None)
+    parser.add_argument("--ollama-url", default="http://localhost:11434")
+    parser.add_argument("--ollama-model", default="llama3.2:latest",
+                        help="Ollama model used by the SQL generation agent under test.")
+    parser.add_argument("--ollama-router-model", default="bitnet-b1.58-large")
+    parser.add_argument("--judge", choices=["ollama", "openai"], default="ollama",
+                        help="DeepEval judge: ollama = local, no API key (default); "
+                             "openai = DeepEval's built-in default, needs OPENAI_API_KEY.")
+    parser.add_argument("--judge-model", default="llama3.2:latest",
+                        help="Ollama model to judge with when --judge ollama.")
     parser.add_argument("--skip-llm-judge", action="store_true",
                          help="Run only the deterministic checks (no DeepEval/API calls).")
     parser.add_argument("--use-ragas", action="store_true",
@@ -334,21 +414,32 @@ def main() -> None:
     cases = load_dataset(args.dataset)
     conn = psycopg2.connect(args.dsn)
 
-    router: IntentRouter = (
-        Bitnet1BitRouter(args.bitnet_binary, args.bitnet_model)
-        if args.bitnet_binary and args.bitnet_model
-        else KeywordFallbackRouter()
-    )
+    router: IntentRouter
+    if args.router == "ollama-bitnet":
+        router = OllamaBitnetRouter(
+            model=args.ollama_router_model, url=args.ollama_url,
+            fallback=KeywordFallbackRouter(),
+        )
+    elif args.router == "bitnet-cpp":
+        if not (args.bitnet_binary and args.bitnet_model):
+            parser.error("--router bitnet-cpp requires --bitnet-binary and --bitnet-model")
+        router = Bitnet1BitRouter(
+            args.bitnet_binary, args.bitnet_model,
+            fallback=KeywordFallbackRouter(),
+        )
+    else:
+        router = KeywordFallbackRouter()
+
     retriever = HybridRetriever(conn, graph_path=args.graph_path)
     validator = ValidationAgent(conn)
 
-    import anthropic
-    generator = SQLGenerationAgent(anthropic.Anthropic())
+    generator = SQLGenerationAgent(ollama_url=args.ollama_url, model=args.ollama_model)
 
     results = [run_deterministic(c, router, retriever, generator, validator) for c in cases]
 
     if not args.skip_llm_judge:
-        run_deepeval_metrics(results)
+        judge = build_ollama_judge(args.judge_model, args.ollama_url) if args.judge == "ollama" else None
+        run_deepeval_metrics(results, judge=judge)
         if args.use_ragas:
             run_ragas_retrieval(results)
 

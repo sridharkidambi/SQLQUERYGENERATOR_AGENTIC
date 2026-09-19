@@ -1,0 +1,189 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1300 950" font-family="Helvetica, Arial, sans-serif">
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#334155"/>
+    </marker>
+    <marker id="arrowRed" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#B91C1C"/>
+    </marker>
+    <marker id="arrowPurple" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#7E22CE"/>
+    </marker>
+  </defs>
+
+  <!-- background -->
+  <rect x="0" y="0" width="1300" height="950" fill="#FFFFFF"/>
+
+  <!-- title -->
+  <text x="650" y="28" text-anchor="middle" font-size="21" font-weight="700" fill="#0F172A">Hybrid-RAG SQL Agent: 1-bit Router + Tiered LoRA / Frontier Generation</text>
+  <text x="650" y="49" text-anchor="middle" font-size="13" fill="#475569">Natural language → validated, read-only SQL against a live Postgres schema</text>
+
+  <!-- ============ MAIN FLOW ============ -->
+
+  <!-- User query -->
+  <rect x="460" y="68" width="400" height="45" rx="8" fill="#F8FAFC" stroke="#334155" stroke-width="1.5"/>
+  <text x="660" y="95" text-anchor="middle" font-size="14" font-weight="600" fill="#0F172A">User NL Query</text>
+  <line x1="660" y1="113" x2="660" y2="138" stroke="#334155" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+  <!-- Router stage -->
+  <rect x="460" y="138" width="400" height="142" rx="10" fill="#EEF2FF" stroke="#4F46E5" stroke-width="1.5"/>
+  <text x="478" y="158" font-size="13" font-weight="700" fill="#3730A3">1) Intent Router — local 1-bit LLM</text>
+
+  <rect x="478" y="172" width="172" height="52" rx="6" fill="#FFFFFF" stroke="#4F46E5"/>
+  <text x="564" y="192" text-anchor="middle" font-size="11.5" font-weight="600" fill="#1E1B4B">OllamaBitnetRouter</text>
+  <text x="564" y="207" text-anchor="middle" font-size="10.5" fill="#334155">BitNet b1.58, ternary weights,</text>
+  <text x="564" y="219" text-anchor="middle" font-size="10.5" fill="#334155">served via Ollama (few-shot vote)</text>
+
+  <rect x="668" y="172" width="172" height="52" rx="6" fill="#FFFFFF" stroke="#4F46E5"/>
+  <text x="754" y="192" text-anchor="middle" font-size="11.5" font-weight="600" fill="#1E1B4B">Bitnet1BitRouter</text>
+  <text x="754" y="207" text-anchor="middle" font-size="10.5" fill="#334155">native bitnet.cpp binary,</text>
+  <text x="754" y="219" text-anchor="middle" font-size="10.5" fill="#334155">i2_s kernel</text>
+
+  <text x="660" y="245" text-anchor="middle" font-size="10.5" fill="#4338CA">both fall back to KeywordFallbackRouter if the model is unavailable / unparseable</text>
+  <text x="660" y="264" text-anchor="middle" font-size="10.5" font-style="italic" fill="#4338CA">on-device, no network call, no API key — cheapest place to reject bad input</text>
+
+  <line x1="660" y1="280" x2="660" y2="303" stroke="#334155" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <text x="672" y="296" font-size="10.5" fill="#334155">SQL_INTENT</text>
+
+  <!-- Refusal branch -->
+  <line x1="860" y1="205" x2="978" y2="205" stroke="#B91C1C" stroke-width="1.5" marker-end="url(#arrowRed)"/>
+  <text x="919" y="197" text-anchor="middle" font-size="10.5" fill="#B91C1C">OUT_OF_SCOPE</text>
+  <rect x="980" y="172" width="280" height="66" rx="8" fill="#FEF2F2" stroke="#B91C1C" stroke-width="1.5"/>
+  <text x="1120" y="196" text-anchor="middle" font-size="12" font-weight="600" fill="#7F1D1D">Fixed refusal — stop</text>
+  <text x="1120" y="212" text-anchor="middle" font-size="10.5" fill="#7F1D1D">"This request is not supported</text>
+  <text x="1120" y="225" text-anchor="middle" font-size="10.5" fill="#7F1D1D">in this agentic application."</text>
+
+  <!-- Retriever stage -->
+  <rect x="460" y="303" width="400" height="155" rx="10" fill="#E0F2FE" stroke="#0284C7" stroke-width="1.5"/>
+  <text x="478" y="323" font-size="13" font-weight="700" fill="#075985">2) Hybrid RAG Retriever</text>
+
+  <rect x="478" y="337" width="172" height="58" rx="6" fill="#FFFFFF" stroke="#0284C7"/>
+  <text x="564" y="358" text-anchor="middle" font-size="11.5" font-weight="600" fill="#0C4A6E">Vector search</text>
+  <text x="564" y="373" text-anchor="middle" font-size="9.3" fill="#334155">pgvector cosine similarity</text>
+  <text x="564" y="386" text-anchor="middle" font-size="9.3" fill="#334155">over schema description embeddings</text>
+
+  <rect x="668" y="337" width="172" height="58" rx="6" fill="#FFFFFF" stroke="#0284C7"/>
+  <text x="754" y="358" text-anchor="middle" font-size="11.5" font-weight="600" fill="#0C4A6E">Graph traversal</text>
+  <text x="754" y="373" text-anchor="middle" font-size="9.3" fill="#334155">FK graph (networkx), shortest</text>
+  <text x="754" y="386" text-anchor="middle" font-size="9.3" fill="#334155">join path between matched tables</text>
+
+  <line x1="564" y1="395" x2="640" y2="415" stroke="#0284C7" stroke-width="1.2"/>
+  <line x1="754" y1="395" x2="680" y2="415" stroke="#0284C7" stroke-width="1.2"/>
+  <rect x="490" y="415" width="340" height="34" rx="6" fill="#FFFFFF" stroke="#0284C7" stroke-width="1.5"/>
+  <text x="660" y="436" text-anchor="middle" font-size="11" font-weight="600" fill="#0C4A6E">Scoped schema context: tables, columns, joins, enum values</text>
+
+  <line x1="660" y1="458" x2="660" y2="483" stroke="#334155" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+  <!-- Generation group border -->
+  <rect x="460" y="483" width="740" height="197" rx="10" fill="none" stroke="#94A3B8" stroke-width="1.5" stroke-dasharray="6,4"/>
+  <text x="474" y="500" font-size="13" font-weight="700" fill="#334155">3) Tiered SQL Generation</text>
+
+  <!-- Tier 1 -->
+  <rect x="480" y="513" width="340" height="65" rx="8" fill="#ECFDF5" stroke="#059669" stroke-width="1.5"/>
+  <text x="650" y="535" text-anchor="middle" font-size="12" font-weight="700" fill="#065F46">Tier 1 — LoRA-fine-tuned model</text>
+  <text x="650" y="551" text-anchor="middle" font-size="10.5" fill="#065F46">served locally via Ollama · free, fast · tried on every request</text>
+  <text x="650" y="565" text-anchor="middle" font-size="10.5" fill="#065F46">same scoped context as every other tier</text>
+
+  <line x1="650" y1="578" x2="650" y2="596" stroke="#334155" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+  <!-- Validate 1 -->
+  <rect x="480" y="596" width="340" height="40" rx="6" fill="#F1F5F9" stroke="#475569" stroke-width="1.5"/>
+  <text x="650" y="620" text-anchor="middle" font-size="11" font-weight="600" fill="#1E293B">Validate: sqlglot parse + live catalog resolution</text>
+
+  <!-- Validate1 -> Tier2 (fail) -->
+  <line x1="820" y1="616" x2="898" y2="616" stroke="#B45309" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <text x="825" y="608" font-size="10" fill="#B45309">fails validation</text>
+
+  <!-- Validate1 -> Final (ok) -->
+  <line x1="650" y1="636" x2="650" y2="706" stroke="#059669" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <text x="658" y="670" font-size="10" fill="#059669">passes</text>
+
+  <!-- Tier 2 -->
+  <rect x="900" y="513" width="290" height="80" rx="8" fill="#FFFBEB" stroke="#B45309" stroke-width="1.5"/>
+  <text x="1045" y="535" text-anchor="middle" font-size="12" font-weight="700" fill="#78350F">Tier 2 — frontier model (Claude)</text>
+  <text x="1045" y="551" text-anchor="middle" font-size="10.5" fill="#78350F">called ONLY when Tier 1 fails validation,</text>
+  <text x="1045" y="564" text-anchor="middle" font-size="10.5" fill="#78350F">given the specific validation error as feedback</text>
+  <text x="1045" y="580" text-anchor="middle" font-size="10.5" font-style="italic" fill="#78350F">— this is where the cost saving comes from</text>
+
+  <line x1="1045" y1="593" x2="1045" y2="608" stroke="#334155" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+  <!-- Validate 2 -->
+  <rect x="900" y="608" width="290" height="40" rx="6" fill="#F1F5F9" stroke="#475569" stroke-width="1.5"/>
+  <text x="1045" y="632" text-anchor="middle" font-size="11" font-weight="600" fill="#1E293B">Validate again (same checks)</text>
+
+  <!-- Validate2 -> Final (ok) -->
+  <polyline points="990,648 990,675 830,675 830,706" fill="none" stroke="#059669" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <text x="900" y="668" font-size="10" fill="#059669">passes</text>
+
+  <!-- Validate2 -> Refusal2 (fail) -->
+  <line x1="1150" y1="648" x2="1150" y2="758" stroke="#B91C1C" stroke-width="1.5" marker-end="url(#arrowRed)"/>
+  <text x="1157" y="705" font-size="10" fill="#B91C1C">fails again</text>
+
+  <!-- Final output -->
+  <rect x="460" y="706" width="400" height="55" rx="8" fill="#F8FAFC" stroke="#334155" stroke-width="1.5"/>
+  <text x="660" y="728" text-anchor="middle" font-size="12" font-weight="700" fill="#0F172A">Final: validated, read-only SQL</text>
+  <text x="660" y="744" text-anchor="middle" font-size="10.5" fill="#334155">+ optional index suggestions from EXPLAIN</text>
+
+  <!-- Refusal 2 -->
+  <rect x="1010" y="758" width="280" height="55" rx="8" fill="#FEF2F2" stroke="#B91C1C" stroke-width="1.5"/>
+  <text x="1150" y="781" text-anchor="middle" font-size="12" font-weight="600" fill="#7F1D1D">Both tiers failed</text>
+  <text x="1150" y="797" text-anchor="middle" font-size="10.5" fill="#7F1D1D">→ fixed refusal, no partial SQL returned</text>
+
+  <!-- ============ OFFLINE TRAINING PIPELINE ============ -->
+  <rect x="20" y="483" width="420" height="300" rx="10" fill="none" stroke="#A855F7" stroke-width="1.5" stroke-dasharray="6,4"/>
+  <text x="34" y="500" font-size="13" font-weight="700" fill="#7E22CE">Offline, one-time: build the Tier-1 model</text>
+
+  <rect x="40" y="514" width="380" height="72" rx="7" fill="#FAF5FF" stroke="#9333EA" stroke-width="1.3"/>
+  <text x="230" y="533" text-anchor="middle" font-size="11" font-weight="600" fill="#581C87">synthetic_data_generator.py</text>
+  <text x="230" y="548" text-anchor="middle" font-size="10" fill="#4C1D95">walks the same FK graph the retriever uses to build</text>
+  <text x="230" y="561" text-anchor="middle" font-size="10" fill="#4C1D95">templated (question, gold SQL) pairs; paraphrases each</text>
+  <text x="230" y="574" text-anchor="middle" font-size="10" fill="#4C1D95">via a local Ollama model for phrasing diversity</text>
+
+  <line x1="230" y1="586" x2="230" y2="600" stroke="#9333EA" stroke-width="1.3" marker-end="url(#arrowPurple)"/>
+
+  <rect x="40" y="600" width="380" height="60" rx="7" fill="#FAF5FF" stroke="#9333EA" stroke-width="1.3"/>
+  <text x="230" y="620" text-anchor="middle" font-size="11" font-weight="600" fill="#581C87">Every row runs through the real</text>
+  <text x="230" y="634" text-anchor="middle" font-size="10" fill="#4C1D95">HybridRetriever + ValidationAgent —</text>
+  <text x="230" y="647" text-anchor="middle" font-size="10" fill="#4C1D95">broken templates are rejected, not memorized</text>
+
+  <line x1="230" y1="660" x2="230" y2="674" stroke="#9333EA" stroke-width="1.3" marker-end="url(#arrowPurple)"/>
+
+  <rect x="40" y="674" width="380" height="46" rx="7" fill="#FAF5FF" stroke="#9333EA" stroke-width="1.3"/>
+  <text x="230" y="692" text-anchor="middle" font-size="11" font-weight="600" fill="#581C87">finetune_lora.py</text>
+  <text x="230" y="706" text-anchor="middle" font-size="10" fill="#4C1D95">LoRA / PEFT fine-tune of a small base model</text>
+
+  <line x1="230" y1="720" x2="230" y2="734" stroke="#9333EA" stroke-width="1.3" marker-end="url(#arrowPurple)"/>
+
+  <rect x="40" y="734" width="380" height="40" rx="7" fill="#FAF5FF" stroke="#9333EA" stroke-width="1.3"/>
+  <text x="230" y="758" text-anchor="middle" font-size="10.5" fill="#4C1D95">merge adapter → GGUF → ollama create sql-lora-ft</text>
+
+  <!-- dashed arrow from offline pipeline to Tier1 -->
+  <polyline points="420,754 452,754 452,545 478,545" fill="none" stroke="#9333EA" stroke-width="1.5" stroke-dasharray="5,4" marker-end="url(#arrowPurple)"/>
+  <text x="435" y="640" font-size="10" fill="#7E22CE" transform="rotate(-90 435 640)" text-anchor="middle">produces model tag</text>
+
+  <!-- ============ LEGEND ============ -->
+  <g font-size="10.5" fill="#334155">
+    <rect x="30" y="845" width="14" height="14" fill="#EEF2FF" stroke="#4F46E5"/>
+    <text x="50" y="856">Router (1-bit, on-device)</text>
+
+    <rect x="230" y="845" width="14" height="14" fill="#E0F2FE" stroke="#0284C7"/>
+    <text x="250" y="856">Hybrid RAG retrieval</text>
+
+    <rect x="410" y="845" width="14" height="14" fill="#ECFDF5" stroke="#059669"/>
+    <text x="430" y="856">Tier 1: LoRA model</text>
+
+    <rect x="580" y="845" width="14" height="14" fill="#FFFBEB" stroke="#B45309"/>
+    <text x="600" y="856">Tier 2: frontier model</text>
+
+    <rect x="770" y="845" width="14" height="14" fill="#F1F5F9" stroke="#475569"/>
+    <text x="790" y="856">Validation / optimization</text>
+
+    <rect x="970" y="845" width="14" height="14" fill="#FEF2F2" stroke="#B91C1C"/>
+    <text x="990" y="856">Refusal path</text>
+
+    <rect x="1110" y="845" width="14" height="14" fill="#FAF5FF" stroke="#9333EA" stroke-dasharray="3,2"/>
+    <text x="1130" y="856">Offline training</text>
+  </g>
+
+  <text x="650" y="905" text-anchor="middle" font-size="10.5" fill="#64748B">Only Tier 1 costs money to run once trained; Tier 2 (Claude) is invoked strictly on validation failure — the fraction tracked as TierStats.tier1_hit_rate.</text>
+</svg>
